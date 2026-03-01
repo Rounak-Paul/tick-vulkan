@@ -1,0 +1,453 @@
+/* ============================================================
+   vulkan.tick — Vulkan binding layer for the Tick language
+   
+   Transpile pipeline: Tick → C → GCC → native binary
+   The `@dataclass` decorator maps directly to a C struct.
+   `extern func` declarations are resolved at link time.
+   
+   KNOWN LANGUAGE LIMITATIONS
+   ──────────────────────────
+   (1) `VkPhysicalDeviceProperties` still requires a raw byte
+       buffer because it embeds `VkPhysicalDeviceLimits` (121+
+       mixed fields, ~524 bytes), which is too large to declare
+       as a full @dataclass.  Fields before `limits` are read
+       with the vk_read_* helpers at known byte offsets.
+       All other Vulkan structs in this binding use typed
+       @dataclass declarations (including VkPhysicalDeviceFeatures
+       and VkPhysicalDeviceMemoryProperties).
+
+   (2) There are no C preprocessor macros.  VK_MAKE_API_VERSION
+       is provided as an ordinary function.  Common API version
+       constants (VK_API_VERSION_1_x) are given as `const`.
+
+   (3) Pointer-to-pointer-to-string (const char* const*) is
+       approximated as `ptr` (void*).  Cast a tick str[] address
+       with cast(addr(arr[0]), ptr) to get the right layout.
+
+   (4) Function names that collide with C standard-library names
+       (e.g. `log`, `pow`, `yn`) will cause "conflicting types"
+       GCC errors.  Avoid single-word names that are also C libc
+       symbols.
+   ============================================================ */
+
+link "-lvulkan";
+link "-Wl,-rpath,/usr/local/lib";
+
+/* ============================================================
+   VkResult codes
+   ============================================================ */
+const VK_SUCCESS                     : i32 = 0;
+const VK_NOT_READY                   : i32 = 1;
+const VK_TIMEOUT                     : i32 = 2;
+const VK_EVENT_SET                   : i32 = 3;
+const VK_EVENT_RESET                 : i32 = 4;
+const VK_INCOMPLETE                  : i32 = 5;
+const VK_ERROR_OUT_OF_HOST_MEMORY    : i32 = -1;
+const VK_ERROR_OUT_OF_DEVICE_MEMORY  : i32 = -2;
+const VK_ERROR_INITIALIZATION_FAILED : i32 = -3;
+const VK_ERROR_DEVICE_LOST           : i32 = -4;
+const VK_ERROR_MEMORY_MAP_FAILED     : i32 = -5;
+const VK_ERROR_LAYER_NOT_PRESENT     : i32 = -6;
+const VK_ERROR_EXTENSION_NOT_PRESENT : i32 = -7;
+const VK_ERROR_FEATURE_NOT_PRESENT   : i32 = -8;
+const VK_ERROR_INCOMPATIBLE_DRIVER   : i32 = -9;
+const VK_ERROR_TOO_MANY_OBJECTS      : i32 = -10;
+const VK_ERROR_FORMAT_NOT_SUPPORTED  : i32 = -11;
+
+/* ============================================================
+   VkStructureType (sType values used in this binding)
+   ============================================================ */
+const VK_STRUCTURE_TYPE_APPLICATION_INFO         : u32 = 0;
+const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO     : u32 = 1;
+const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO : u32 = 2;
+const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO       : u32 = 3;
+
+/* ============================================================
+   VkPhysicalDeviceType
+   ============================================================ */
+const VK_PHYSICAL_DEVICE_TYPE_OTHER          : u32 = 0;
+const VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU : u32 = 1;
+const VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   : u32 = 2;
+const VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    : u32 = 3;
+const VK_PHYSICAL_DEVICE_TYPE_CPU            : u32 = 4;
+
+/* ============================================================
+   VkQueueFlagBits
+   ============================================================ */
+const VK_QUEUE_GRAPHICS_BIT       : u32 = 1;
+const VK_QUEUE_COMPUTE_BIT        : u32 = 2;
+const VK_QUEUE_TRANSFER_BIT       : u32 = 4;
+const VK_QUEUE_SPARSE_BINDING_BIT : u32 = 8;
+const VK_QUEUE_PROTECTED_BIT      : u32 = 16;
+
+/* ============================================================
+   VkMemoryPropertyFlagBits
+   ============================================================ */
+const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT     : u32 = 1;
+const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT     : u32 = 2;
+const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT    : u32 = 4;
+const VK_MEMORY_PROPERTY_HOST_CACHED_BIT      : u32 = 8;
+const VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT : u32 = 16;
+
+/* ============================================================
+   VkMemoryHeapFlagBits
+   ============================================================ */
+const VK_MEMORY_HEAP_DEVICE_LOCAL_BIT   : u32 = 1;
+const VK_MEMORY_HEAP_MULTI_INSTANCE_BIT : u32 = 2;
+
+/* ============================================================
+   VkInstanceCreateFlagBits
+   VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR is required
+   on macOS/MoltenVK so that MoltenVK devices are enumerated.
+   ============================================================ */
+const VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : u32 = 1;
+
+/* ============================================================
+   Pre-computed API version constants
+   Formula: (major << 22) | (minor << 12) | patch
+   ============================================================ */
+const VK_API_VERSION_1_0 : u32 = 4194304;   /* 1.0.0 */
+const VK_API_VERSION_1_1 : u32 = 4198400;   /* 1.1.0 */
+const VK_API_VERSION_1_2 : u32 = 4202496;   /* 1.2.0 */
+const VK_API_VERSION_1_3 : u32 = 4206592;   /* 1.3.0 */
+
+/* NOTE: Platform-specific extension name strings (VK_KHR_portability_*)
+   must be declared in the application's own file, not in this module.
+   The Tick compiler does not propagate -D flags to imported files, so
+   @if(MACOS) blocks in imported modules always resolve to @else.
+   See sandbox.tick for an example of the correct placement. */
+
+/* ============================================================
+   VkPhysicalDeviceProperties raw-buffer constants
+   
+   VkPhysicalDeviceProperties embeds VkPhysicalDeviceLimits —
+   too large for a practical @dataclass.  Allocate a raw buffer
+   and read individual fields at the offsets listed here.
+   
+   Byte layout (Vulkan spec, x86-64 / AArch64):
+     offset  0 : apiVersion    (u32)
+     offset  4 : driverVersion (u32)
+     offset  8 : vendorID      (u32)
+     offset 12 : deviceID      (u32)
+     offset 16 : deviceType    (u32)
+     offset 20 : deviceName    (char[256])
+     offset 276: pipelineCacheUUID (uint8_t[16])
+     offset 292: limits        (VkPhysicalDeviceLimits, ~524 B)
+   ============================================================ */
+const VK_PHYSICAL_DEVICE_PROPERTIES_SIZE : u64 = 1024;
+const VK_PROPS_OFFSET_API_VERSION    : i32 = 0;
+const VK_PROPS_OFFSET_DRIVER_VERSION : i32 = 4;
+const VK_PROPS_OFFSET_VENDOR_ID      : i32 = 8;
+const VK_PROPS_OFFSET_DEVICE_ID      : i32 = 12;
+const VK_PROPS_OFFSET_DEVICE_TYPE    : i32 = 16;
+const VK_PROPS_OFFSET_DEVICE_NAME    : i32 = 20;
+
+
+/* ============================================================
+   @dataclass declarations
+   ============================================================ */
+
+/* VkApplicationInfo — 48 bytes */
+@dataclass
+class VkApplicationInfo {
+    var sType              : u32;
+    var pNext              : ptr;
+    var pApplicationName   : str;
+    var applicationVersion : u32;
+    var pEngineName        : str;
+    var engineVersion      : u32;
+    var apiVersion         : u32;
+}
+
+/* VkInstanceCreateInfo — 64 bytes */
+@dataclass
+class VkInstanceCreateInfo {
+    var sType                   : u32;
+    var pNext                   : ptr;
+    var flags                   : u32;
+    var pApplicationInfo        : ptr<VkApplicationInfo>;
+    var enabledLayerCount       : u32;
+    var ppEnabledLayerNames     : ptr;   /* const char* const* */
+    var enabledExtensionCount   : u32;
+    var ppEnabledExtensionNames : ptr;   /* const char* const* */
+}
+
+/* VkExtent3D — 12 bytes */
+@dataclass
+class VkExtent3D {
+    var width  : u32;
+    var height : u32;
+    var depth  : u32;
+}
+
+/* VkQueueFamilyProperties — 24 bytes */
+@dataclass
+class VkQueueFamilyProperties {
+    var queueFlags                  : u32;
+    var queueCount                  : u32;
+    var timestampValidBits          : u32;
+    var minImageTransferGranularity : VkExtent3D;
+}
+
+/* VkDeviceQueueCreateInfo — 40 bytes */
+@dataclass
+class VkDeviceQueueCreateInfo {
+    var sType            : u32;
+    var pNext            : ptr;
+    var flags            : u32;
+    var queueFamilyIndex : u32;
+    var queueCount       : u32;
+    var pQueuePriorities : ptr;   /* const float* */
+}
+
+/* VkDeviceCreateInfo — 72 bytes */
+@dataclass
+class VkDeviceCreateInfo {
+    var sType                   : u32;
+    var pNext                   : ptr;
+    var flags                   : u32;
+    var queueCreateInfoCount    : u32;
+    var pQueueCreateInfos       : ptr<VkDeviceQueueCreateInfo>;
+    var enabledLayerCount       : u32;
+    var ppEnabledLayerNames     : ptr;
+    var enabledExtensionCount   : u32;
+    var ppEnabledExtensionNames : ptr;   /* const char* const* */
+    var pEnabledFeatures        : ptr;   /* ptr<VkPhysicalDeviceFeatures> or null */
+}
+
+/* VkPhysicalDeviceFeatures — 220 bytes (55 × VkBool32/u32).
+   Fields listed in Vulkan spec order → exact C ABI match. */
+@dataclass
+class VkPhysicalDeviceFeatures {
+    var robustBufferAccess                      : u32;
+    var fullDrawIndexUint32                     : u32;
+    var imageCubeArray                          : u32;
+    var independentBlend                        : u32;
+    var geometryShader                          : u32;
+    var tessellationShader                      : u32;
+    var sampleRateShading                       : u32;
+    var dualSrcBlend                            : u32;
+    var logicOp                                 : u32;
+    var multiDrawIndirect                       : u32;
+    var drawIndirectFirstInstance               : u32;
+    var depthClamp                              : u32;
+    var depthBiasClamp                          : u32;
+    var fillModeNonSolid                        : u32;
+    var depthBounds                             : u32;
+    var wideLines                               : u32;
+    var largePoints                             : u32;
+    var alphaToOne                              : u32;
+    var multiViewport                           : u32;
+    var samplerAnisotropy                       : u32;
+    var textureCompressionETC2                  : u32;
+    var textureCompressionASTC_LDR              : u32;
+    var textureCompressionBC                    : u32;
+    var occlusionQueryPrecise                   : u32;
+    var pipelineStatisticsQuery                 : u32;
+    var vertexPipelineStoresAndAtomics          : u32;
+    var fragmentStoresAndAtomics                : u32;
+    var shaderTessellationAndGeometryPointSize  : u32;
+    var shaderImageGatherExtended               : u32;
+    var shaderStorageImageExtendedFormats       : u32;
+    var shaderStorageImageMultisample           : u32;
+    var shaderStorageImageReadWithoutFormat     : u32;
+    var shaderStorageImageWriteWithoutFormat    : u32;
+    var shaderUniformBufferArrayDynamicIndexing : u32;
+    var shaderSampledImageArrayDynamicIndexing  : u32;
+    var shaderStorageBufferArrayDynamicIndexing : u32;
+    var shaderStorageImageArrayDynamicIndexing  : u32;
+    var shaderClipDistance                      : u32;
+    var shaderCullDistance                      : u32;
+    var shaderFloat64                           : u32;
+    var shaderInt64                             : u32;
+    var shaderInt16                             : u32;
+    var shaderResourceResidency                 : u32;
+    var shaderResourceMinLod                    : u32;
+    var sparseBinding                           : u32;
+    var sparseResidencyBuffer                   : u32;
+    var sparseResidencyImage2D                  : u32;
+    var sparseResidencyImage3D                  : u32;
+    var sparseResidency2Samples                 : u32;
+    var sparseResidency4Samples                 : u32;
+    var sparseResidency8Samples                 : u32;
+    var sparseResidency16Samples                : u32;
+    var sparseResidencyAliased                  : u32;
+    var variableMultisampleRate                 : u32;
+    var inheritedQueries                        : u32;
+}
+
+/* VkMemoryType — 8 bytes */
+@dataclass
+class VkMemoryType {
+    var propertyFlags : u32;
+    var heapIndex     : u32;
+}
+
+/* VkMemoryHeap — 16 bytes (u64 size + u32 flags + 4-byte implicit pad) */
+@dataclass
+class VkMemoryHeap {
+    var size  : u64;
+    var flags : u32;
+}
+
+/* VkPhysicalDeviceMemoryProperties — 520 bytes
+   Memory layout (Vulkan spec, x86-64 / AArch64):
+     offset   0 : memoryTypeCount (u32)
+     offset   4 : memoryTypes[32] (VkMemoryType × 32 = 256 B)
+     offset 260 : memoryHeapCount (u32)
+     offset 264 : memoryHeaps[16] (VkMemoryHeap × 16 = 256 B, 8-byte aligned)
+   Total: 520 bytes.                                              */
+@dataclass
+class VkPhysicalDeviceMemoryProperties {
+    var memoryTypeCount : u32;
+    var memoryTypes     : VkMemoryType[32];
+    var memoryHeapCount : u32;
+    var memoryHeaps     : VkMemoryHeap[16];
+}
+
+
+/* ============================================================
+   Extern Vulkan function declarations
+   ============================================================ */
+
+extern func vkCreateInstance(
+    pCreateInfo : ptr<VkInstanceCreateInfo>,
+    pAllocator  : ptr,
+    pInstance   : ptr<ptr>
+) : i32;
+
+extern func vkDestroyInstance(instance : ptr, pAllocator : ptr) : void;
+
+extern func vkEnumeratePhysicalDevices(
+    instance             : ptr,
+    pPhysicalDeviceCount : ptr<u32>,
+    pPhysicalDevices     : ptr<ptr>
+) : i32;
+
+/* pProperties must point to VK_PHYSICAL_DEVICE_PROPERTIES_SIZE bytes
+   (raw buffer — see LIMITATION 1 in file header).                    */
+extern func vkGetPhysicalDeviceProperties(
+    physicalDevice : ptr,
+    pProperties    : ptr
+) : void;
+
+extern func vkGetPhysicalDeviceFeatures(
+    physicalDevice : ptr,
+    pFeatures      : ptr<VkPhysicalDeviceFeatures>
+) : void;
+
+extern func vkGetPhysicalDeviceMemoryProperties(
+    physicalDevice    : ptr,
+    pMemoryProperties : ptr<VkPhysicalDeviceMemoryProperties>
+) : void;
+
+extern func vkGetPhysicalDeviceQueueFamilyProperties(
+    physicalDevice            : ptr,
+    pQueueFamilyPropertyCount : ptr<u32>,
+    pQueueFamilyProperties    : ptr<VkQueueFamilyProperties>
+) : void;
+
+extern func vkCreateDevice(
+    physicalDevice : ptr,
+    pCreateInfo    : ptr<VkDeviceCreateInfo>,
+    pAllocator     : ptr,
+    pDevice        : ptr<ptr>
+) : i32;
+
+extern func vkDestroyDevice(device : ptr, pAllocator : ptr) : void;
+
+extern func vkGetDeviceQueue(
+    device           : ptr,
+    queueFamilyIndex : u32,
+    queueIndex       : u32,
+    pQueue           : ptr<ptr>
+) : void;
+
+extern func vkEnumerateInstanceExtensionProperties(
+    pLayerName     : str,
+    pPropertyCount : ptr<u32>,
+    pProperties    : ptr
+) : i32;
+
+extern func vkEnumerateInstanceLayerProperties(
+    pPropertyCount : ptr<u32>,
+    pProperties    : ptr
+) : i32;
+
+
+/* ============================================================
+   Raw-memory field helpers
+   Only needed for VkPhysicalDeviceProperties (VkPhysicalDevice
+   Limits embedded within it prevents a full @dataclass).
+   ============================================================ */
+
+func vk_read_u32(mem : ptr, byte_offset : i32) : u32 {
+    var p : ptr<u8>  = cast(mem, ptr<u8>);
+    var q : ptr<u32> = cast(p + byte_offset, ptr<u32>);
+    return deref(q);
+}
+
+func vk_read_u64(mem : ptr, byte_offset : i32) : u64 {
+    var p : ptr<u8>  = cast(mem, ptr<u8>);
+    var q : ptr<u64> = cast(p + byte_offset, ptr<u64>);
+    return deref(q);
+}
+
+/* Returns a str pointing into the caller's buffer — do NOT free it. */
+func vk_read_str(mem : ptr, byte_offset : i32) : str {
+    var p : ptr<u8> = cast(mem, ptr<u8>);
+    return cast(p + byte_offset, str);
+}
+
+
+/* ============================================================
+   Utility helpers
+   ============================================================ */
+
+func vk_api_major(v : u32) : u32 { return (v >> 22) & 127;  }
+func vk_api_minor(v : u32) : u32 { return (v >> 12) & 1023; }
+func vk_api_patch(v : u32) : u32 { return v & 4095;         }
+
+func vk_make_api_version(major : u32, minor : u32, patch : u32) : u32 {
+    return (major << 22) | (minor << 12) | patch;
+}
+
+func vk_device_type_str(device_type : u32) : str {
+    switch (device_type) {
+        case 0: return "Other";
+        case 1: return "Integrated GPU";
+        case 2: return "Discrete GPU";
+        case 3: return "Virtual GPU";
+        case 4: return "CPU (software renderer)";
+        default: return "Unknown";
+    }
+}
+
+func vk_result_str(result : i32) : str {
+    switch (result) {
+        case 0:   return "VK_SUCCESS";
+        case 1:   return "VK_NOT_READY";
+        case 2:   return "VK_TIMEOUT";
+        case 3:   return "VK_EVENT_SET";
+        case 4:   return "VK_EVENT_RESET";
+        case 5:   return "VK_INCOMPLETE";
+        case -1:  return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case -2:  return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case -3:  return "VK_ERROR_INITIALIZATION_FAILED";
+        case -4:  return "VK_ERROR_DEVICE_LOST";
+        case -5:  return "VK_ERROR_MEMORY_MAP_FAILED";
+        case -6:  return "VK_ERROR_LAYER_NOT_PRESENT";
+        case -7:  return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case -8:  return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case -9:  return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        default:  return "VK_ERROR (unknown code)";
+    }
+}
+
+func vk_print_queue_flags(flags : u32) : void {
+    if ((flags & 1)  != 0) { print(" GRAPHICS");       }
+    if ((flags & 2)  != 0) { print(" COMPUTE");        }
+    if ((flags & 4)  != 0) { print(" TRANSFER");       }
+    if ((flags & 8)  != 0) { print(" SPARSE_BINDING"); }
+    if ((flags & 16) != 0) { print(" PROTECTED");      }
+}

@@ -1,0 +1,538 @@
+/* ============================================================
+   sandbox.tick — tick-vulkan device enumeration demo
+   
+   Build (macOS):
+     tick sandbox.tick -DMACOS -o sandbox
+   
+   Build (Linux / Windows — remove portability extensions):
+     tick sandbox.tick -o sandbox
+   
+   Run:
+     ./sandbox
+   
+   What this demo does
+   ───────────────────
+   1.  Creates a VkInstance (with MoltenVK portability extensions
+       on macOS via -DMACOS conditional compilation).
+   2.  Enumerates all available physical devices.
+   3.  For every device prints:
+         • Name, type, API version, driver version
+         • Queue families and their capability flags
+         • Memory heaps (sizes) and memory types (property flags)
+         • Key physical-device features (geometry shader, etc.)
+   4.  Selects the "best" device: discrete GPU → integrated → first.
+   5.  Creates a VkDevice (logical device) with one graphics queue.
+   6.  Retrieves the VkQueue handle.
+   7.  Prints a final capabilities summary.
+   8.  Destroys the logical device then the instance (full cleanup).
+   ============================================================ */
+
+from vulkan import *;
+
+/* ============================================================
+   Platform toggles — set by -DMACOS on the command line.
+   These constants drive the extension arrays in create_instance
+   and create_logical_device below.
+   ============================================================ */
+/* Platform extension names and counts.
+   NOTE: @if(MACOS) blocks must be in this file (not in imported modules)
+   because the Tick compiler does not propagate -D flags to imports.    */
+@if(MACOS) {
+    const PLATFORM_INSTANCE_EXT_COUNT : u32 = 2;
+    const PLATFORM_INSTANCE_FLAGS     : u32 = 1;  /* VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR */
+    const PLATFORM_DEVICE_EXT_COUNT   : u32 = 1;
+    const VK_EXT_PORTABILITY_ENUMERATION  : str = "VK_KHR_portability_enumeration";
+    const VK_EXT_GET_PHYS_DEV_PROPERTIES2 : str = "VK_KHR_get_physical_device_properties2";
+    const VK_DEV_EXT_PORTABILITY_SUBSET   : str = "VK_KHR_portability_subset";
+} @else {
+    const PLATFORM_INSTANCE_EXT_COUNT : u32 = 0;
+    const PLATFORM_INSTANCE_FLAGS     : u32 = 0;
+    const PLATFORM_DEVICE_EXT_COUNT   : u32 = 0;
+    const VK_EXT_PORTABILITY_ENUMERATION  : str = "";
+    const VK_EXT_GET_PHYS_DEV_PROPERTIES2 : str = "";
+    const VK_DEV_EXT_PORTABILITY_SUBSET   : str = "";
+}
+
+
+/* ────────────────────────────────────────────────────────────────
+   Helper: check Vulkan result and print an error message.
+   Returns true on VK_SUCCESS, false otherwise.
+   ──────────────────────────────────────────────────────────────── */
+func check(result : i32, label : str) : b8 {
+    if (result != VK_SUCCESS) {
+        println("[FAIL] " + label + " → " +
+                vk_result_str(result) + " (" + to_str(result) + ")");
+        return false;
+    }
+    return true;
+}
+
+/* ────────────────────────────────────────────────────────────────
+   bool_str — "yes" / "no" for a VkBool32 (u32) field.
+   Named bool_str to avoid collision with C standard-library names
+   (e.g. <math.h> declares double yn(int, double) on macOS).
+   ──────────────────────────────────────────────────────────────── */
+func bool_str(v : u32) : str {
+    if (v != 0) { return "yes"; }
+    return "no";
+}
+
+/* ────────────────────────────────────────────────────────────────
+   create_instance
+   
+   Creates a VkInstance.  Returns null on failure.
+   
+   On macOS (-DMACOS), two portability extensions and the matching
+   instance flag are required for MoltenVK to expose any devices.
+   On Linux / Windows, compile without -DMACOS; the extension list
+   will be empty and the flag will be 0.
+   ──────────────────────────────────────────────────────────────── */
+func create_instance() : ptr {
+    var app_info : VkApplicationInfo;
+    app_info.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pNext              = null;
+    app_info.pApplicationName   = "tick-vulkan sandbox";
+    app_info.applicationVersion = 1;
+    app_info.pEngineName        = "tick-engine";
+    app_info.engineVersion      = 1;
+    app_info.apiVersion         = VK_API_VERSION_1_2;
+
+    /* macOS / MoltenVK portability extensions.
+       LIMITATION: Tick str[] is a GC-managed dynamic array; we
+       take addr(arr[0]) and cast to ptr to obtain a const char**.
+       On non-macOS builds this array is never passed to Vulkan
+       (PLATFORM_INSTANCE_EXT_COUNT == 0).                        */
+    var exts : str[] = [
+        VK_EXT_PORTABILITY_ENUMERATION,
+        VK_EXT_GET_PHYS_DEV_PROPERTIES2
+    ];
+
+    var create_info : VkInstanceCreateInfo;
+    create_info.sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    create_info.pNext                   = null;
+    create_info.flags                   = PLATFORM_INSTANCE_FLAGS;
+    create_info.pApplicationInfo        = addr(app_info);
+    create_info.enabledLayerCount       = 0;
+    create_info.ppEnabledLayerNames     = null;
+    create_info.enabledExtensionCount   = PLATFORM_INSTANCE_EXT_COUNT;
+    create_info.ppEnabledExtensionNames = cast(addr(exts[0]), ptr);
+
+    var instance : ptr = null;
+    var result : i32 = vkCreateInstance(addr(create_info), null, addr(instance));
+
+    if (result != VK_SUCCESS) {
+        println("[FAIL] vkCreateInstance → " + vk_result_str(result));
+        println("       On macOS: ensure the Vulkan SDK / MoltenVK is installed");
+        println("       and compile with -DMACOS: tick sandbox.tick -DMACOS -o sandbox");
+        return null;
+    }
+
+    println("[OK] VkInstance created.");
+    return instance;
+}
+
+/* ────────────────────────────────────────────────────────────────
+   enumerate_devices
+   
+   Fills *out_count with the device count and returns a
+   malloc'd ptr<ptr> (array of VkPhysicalDevice handles).
+   Caller must free() the returned pointer when done.
+   ──────────────────────────────────────────────────────────────── */
+func enumerate_devices(instance : ptr, out_count : ptr<u32>) : ptr<ptr> {
+    var count : u32 = 0;
+
+    var r : i32 = vkEnumeratePhysicalDevices(instance, addr(count), null);
+    if (r != VK_SUCCESS) {
+        println("[FAIL] vkEnumeratePhysicalDevices (count) → " + vk_result_str(r));
+        deref(out_count) = 0;
+        return null;
+    }
+    if (count == 0) {
+        println("[WARN] No Vulkan-capable physical devices found.");
+        deref(out_count) = 0;
+        return null;
+    }
+
+    var buf : ptr = malloc(cast(count, u64) * 8);
+    memset(buf, 0, cast(count, u64) * 8);
+
+    r = vkEnumeratePhysicalDevices(instance, addr(count), cast(buf, ptr<ptr>));
+    if (r != VK_SUCCESS) {
+        println("[FAIL] vkEnumeratePhysicalDevices (fill) → " + vk_result_str(r));
+        free(buf);
+        deref(out_count) = 0;
+        return null;
+    }
+
+    deref(out_count) = count;
+    return cast(buf, ptr<ptr>);
+}
+
+/* ────────────────────────────────────────────────────────────────
+   print_device_properties
+   
+   Reads VkPhysicalDeviceProperties into a raw buffer and prints
+   summary fields.  A raw buffer is used because the struct
+   embeds VkPhysicalDeviceLimits, which is too large to represent
+   as a full @dataclass (see LIMITATION 1 in vulkan.tick).
+   ──────────────────────────────────────────────────────────────── */
+func print_device_properties(device : ptr) : void {
+    var props : ptr = malloc(VK_PHYSICAL_DEVICE_PROPERTIES_SIZE);
+    memset(props, 0, VK_PHYSICAL_DEVICE_PROPERTIES_SIZE);
+    vkGetPhysicalDeviceProperties(device, props);
+
+    var api_ver   : u32 = vk_read_u32(props, VK_PROPS_OFFSET_API_VERSION);
+    var drv_ver   : u32 = vk_read_u32(props, VK_PROPS_OFFSET_DRIVER_VERSION);
+    var vendor_id : u32 = vk_read_u32(props, VK_PROPS_OFFSET_VENDOR_ID);
+    var device_id : u32 = vk_read_u32(props, VK_PROPS_OFFSET_DEVICE_ID);
+    var dev_type  : u32 = vk_read_u32(props, VK_PROPS_OFFSET_DEVICE_TYPE);
+    var dev_name  : str = vk_read_str(props,  VK_PROPS_OFFSET_DEVICE_NAME);
+
+    println("  Name        : " + dev_name);
+    println("  Type        : " + vk_device_type_str(dev_type));
+    println("  VendorID    : " + to_str(vendor_id));
+    println("  DeviceID    : " + to_str(device_id));
+    println("  API version : " +
+            to_str(vk_api_major(api_ver)) + "." +
+            to_str(vk_api_minor(api_ver)) + "." +
+            to_str(vk_api_patch(api_ver)));
+    println("  Drv version : " +
+            to_str(vk_api_major(drv_ver)) + "." +
+            to_str(vk_api_minor(drv_ver)) + "." +
+            to_str(vk_api_patch(drv_ver)));
+
+    free(props);
+}
+
+/* ────────────────────────────────────────────────────────────────
+   print_queue_families
+   
+   Retrieves VkQueueFamilyProperties for each queue family and
+   prints capability flags.  Returns the index of the first
+   GRAPHICS-capable family, or 0xFFFFFFFF if none found.
+   ──────────────────────────────────────────────────────────────── */
+func print_queue_families(device : ptr) : u32 {
+    var count : u32 = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(device, addr(count), null);
+
+    if (count == 0) {
+        println("  (no queue families reported)");
+        return 4294967295;
+    }
+
+    var stride  : u64 = sizeof(VkQueueFamilyProperties);
+    var buf     : ptr = malloc(cast(count, u64) * stride);
+    memset(buf, 0, cast(count, u64) * stride);
+
+    vkGetPhysicalDeviceQueueFamilyProperties(
+        device, addr(count),
+        cast(buf, ptr<VkQueueFamilyProperties>)
+    );
+
+    var gfx_family : u32 = 4294967295;
+
+    println("  Queue families (" + to_str(count) + "):");
+    for (var i : u32 = 0; i < count; i++) {
+        var qfp : VkQueueFamilyProperties =
+            deref(cast(buf, ptr<VkQueueFamilyProperties>) + cast(i, i32));
+
+        print("    [" + to_str(i) + "] queues=" + to_str(qfp.queueCount) + " flags:");
+        vk_print_queue_flags(qfp.queueFlags);
+        println("");
+
+        if ((qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+            if (gfx_family == 4294967295) {
+                gfx_family = i;
+            }
+        }
+    }
+
+    free(buf);
+    return gfx_family;
+}
+
+/* ────────────────────────────────────────────────────────────────
+   print_memory_properties
+   
+   Uses the VkPhysicalDeviceMemoryProperties @dataclass directly.
+   VkMemoryType[32] and VkMemoryHeap[16] fixed-size inline arrays
+   are now supported in @dataclass, so no raw byte buffer is
+   needed here.
+   ──────────────────────────────────────────────────────────────── */
+func print_memory_properties(device : ptr) : void {
+    var mp : VkPhysicalDeviceMemoryProperties;
+    vkGetPhysicalDeviceMemoryProperties(device, addr(mp));
+
+    println("  Memory heaps (" + to_str(mp.memoryHeapCount) + "):");
+    for (var h : u32 = 0; h < mp.memoryHeapCount; h++) {
+        var sz  : u64 = mp.memoryHeaps[cast(h, i32)].size;
+        var flg : u32 = mp.memoryHeaps[cast(h, i32)].flags;
+
+        var gib : u64 = sz / 1073741824;
+        var mib : u64 = (sz % 1073741824) / 1048576;
+
+        print("    Heap [" + to_str(h) + "]: " +
+              to_str(gib) + " GiB " + to_str(mib) + " MiB");
+        if ((flg & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)   != 0) { print("  [DEVICE_LOCAL]");    }
+        if ((flg & VK_MEMORY_HEAP_MULTI_INSTANCE_BIT) != 0) { print("  [MULTI_INSTANCE]");  }
+        println("");
+    }
+
+    println("  Memory types (" + to_str(mp.memoryTypeCount) + "):");
+    for (var t : u32 = 0; t < mp.memoryTypeCount; t++) {
+        var pf : u32 = mp.memoryTypes[cast(t, i32)].propertyFlags;
+        var hi : u32 = mp.memoryTypes[cast(t, i32)].heapIndex;
+
+        print("    Type [" + to_str(t) + "] heap=" + to_str(hi) + ":");
+        if ((pf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)     != 0) { print(" DEVICE_LOCAL");     }
+        if ((pf & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)     != 0) { print(" HOST_VISIBLE");     }
+        if ((pf & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)    != 0) { print(" HOST_COHERENT");    }
+        if ((pf & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)      != 0) { print(" HOST_CACHED");      }
+        if ((pf & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) != 0) { print(" LAZILY_ALLOCATED"); }
+        println("");
+    }
+}
+
+/* ────────────────────────────────────────────────────────────────
+   print_features
+   
+   Uses the VkPhysicalDeviceFeatures @dataclass directly.
+   With all 55 VkBool32 fields declared in the struct, individual
+   features are accessed as named fields — no raw byte arithmetic.
+   ──────────────────────────────────────────────────────────────── */
+func print_features(device : ptr) : void {
+    var feat : VkPhysicalDeviceFeatures;
+    vkGetPhysicalDeviceFeatures(device, addr(feat));
+
+    println("  Features (selection):");
+    println("    geometryShader      : " + bool_str(feat.geometryShader));
+    println("    tessellationShader  : " + bool_str(feat.tessellationShader));
+    println("    multiDrawIndirect   : " + bool_str(feat.multiDrawIndirect));
+    println("    multiViewport       : " + bool_str(feat.multiViewport));
+    println("    samplerAnisotropy   : " + bool_str(feat.samplerAnisotropy));
+    println("    textureComprETC2    : " + bool_str(feat.textureCompressionETC2));
+    println("    textureComprBC      : " + bool_str(feat.textureCompressionBC));
+    println("    shaderFloat64       : " + bool_str(feat.shaderFloat64));
+    println("    shaderInt64         : " + bool_str(feat.shaderInt64));
+}
+
+/* ────────────────────────────────────────────────────────────────
+   select_device
+   
+   Returns the index of the preferred physical device:
+   discrete GPU first, then integrated GPU, then device 0.
+   ──────────────────────────────────────────────────────────────── */
+func select_device(devices : ptr<ptr>, count : u32) : u32 {
+    for (var i : u32 = 0; i < count; i++) {
+        var dev   : ptr = deref(devices + cast(i, i32));
+        var props : ptr = malloc(VK_PHYSICAL_DEVICE_PROPERTIES_SIZE);
+        memset(props, 0, VK_PHYSICAL_DEVICE_PROPERTIES_SIZE);
+        vkGetPhysicalDeviceProperties(dev, props);
+        var dtype : u32 = vk_read_u32(props, VK_PROPS_OFFSET_DEVICE_TYPE);
+        free(props);
+        if (dtype == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { return i; }
+    }
+    for (var i : u32 = 0; i < count; i++) {
+        var dev   : ptr = deref(devices + cast(i, i32));
+        var props : ptr = malloc(VK_PHYSICAL_DEVICE_PROPERTIES_SIZE);
+        memset(props, 0, VK_PHYSICAL_DEVICE_PROPERTIES_SIZE);
+        vkGetPhysicalDeviceProperties(dev, props);
+        var dtype : u32 = vk_read_u32(props, VK_PROPS_OFFSET_DEVICE_TYPE);
+        free(props);
+        if (dtype == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) { return i; }
+    }
+    return 0;
+}
+
+/* ────────────────────────────────────────────────────────────────
+   create_logical_device
+   
+   Creates a VkDevice with a single graphics queue.
+   Returns null on failure.
+   
+   On macOS (-DMACOS) VK_KHR_portability_subset is mandatory.
+   PLATFORM_DEVICE_EXT_COUNT is 1 on macOS and 0 elsewhere.
+   ──────────────────────────────────────────────────────────────── */
+func create_logical_device(physical : ptr, gfx_family : u32) : ptr {
+    var priority : f32 = 1.0;
+
+    var qci : VkDeviceQueueCreateInfo;
+    qci.sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qci.pNext            = null;
+    qci.flags            = 0;
+    qci.queueFamilyIndex = gfx_family;
+    qci.queueCount       = 1;
+    qci.pQueuePriorities = cast(addr(priority), ptr);
+
+    /* macOS/MoltenVK mandatory device extension. */
+    var dev_exts : str[] = [VK_DEV_EXT_PORTABILITY_SUBSET];
+
+    var dci : VkDeviceCreateInfo;
+    dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dci.pNext                   = null;
+    dci.flags                   = 0;
+    dci.queueCreateInfoCount    = 1;
+    dci.pQueueCreateInfos       = addr(qci);
+    dci.enabledLayerCount       = 0;
+    dci.ppEnabledLayerNames     = null;
+    dci.enabledExtensionCount   = PLATFORM_DEVICE_EXT_COUNT;
+    dci.ppEnabledExtensionNames = cast(addr(dev_exts[0]), ptr);
+    dci.pEnabledFeatures        = null;
+
+    var device : ptr = null;
+    var r : i32 = vkCreateDevice(physical, addr(dci), null, addr(device));
+    if (r != VK_SUCCESS) {
+        println("[FAIL] vkCreateDevice → " + vk_result_str(r));
+        return null;
+    }
+
+    println("[OK] VkDevice (logical device) created.");
+    return device;
+}
+
+/* ────────────────────────────────────────────────────────────────
+   find_gfx_family
+   
+   Same logic as print_queue_families but without print output.
+   Returns the first GRAPHICS-capable family index, or 0xFFFFFFFF.
+   ──────────────────────────────────────────────────────────────── */
+func find_gfx_family(device : ptr) : u32 {
+    var count : u32 = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(device, addr(count), null);
+    if (count == 0) { return 4294967295; }
+
+    var stride : u64 = sizeof(VkQueueFamilyProperties);
+    var buf    : ptr = malloc(cast(count, u64) * stride);
+    memset(buf, 0, cast(count, u64) * stride);
+
+    vkGetPhysicalDeviceQueueFamilyProperties(
+        device, addr(count),
+        cast(buf, ptr<VkQueueFamilyProperties>)
+    );
+
+    var result : u32 = 4294967295;
+    for (var i : u32 = 0; i < count; i++) {
+        var qfp : VkQueueFamilyProperties =
+            deref(cast(buf, ptr<VkQueueFamilyProperties>) + cast(i, i32));
+        if ((qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+            if (result == 4294967295) { result = i; }
+        }
+    }
+    free(buf);
+    return result;
+}
+
+/* ────────────────────────────────────────────────────────────────
+   main
+   ──────────────────────────────────────────────────────────────── */
+func main() : i32 {
+    println("╔══════════════════════════════════╗");
+    println("║   tick-vulkan sandbox             ║");
+    println("╚══════════════════════════════════╝");
+    println("");
+
+    /* ── 1. Create VkInstance ── */
+    var instance : ptr = create_instance();
+    if (instance == null) { return 1; }
+    println("");
+
+    /* ── 2. Enumerate physical devices ── */
+    println("── Enumerating physical devices ──────────────────────────");
+    var dev_count : u32 = 0;
+    var devices   : ptr<ptr> = enumerate_devices(instance, addr(dev_count));
+    if (devices == null) {
+        vkDestroyInstance(instance, null);
+        return 1;
+    }
+    println("Found " + to_str(dev_count) + " device(s).\n");
+
+    /* ── 3. Print capabilities for every device ── */
+    for (var i : u32 = 0; i < dev_count; i++) {
+        var phys : ptr = deref(devices + cast(i, i32));
+        println("Device [" + to_str(i) + "]");
+        println("───────────────────────────────────────────────────────");
+        print_device_properties(phys);
+        print_queue_families(phys);
+        print_memory_properties(phys);
+        print_features(phys);
+        println("");
+    }
+
+    /* ── 4. Select preferred device ── */
+    var sel      : u32 = select_device(devices, dev_count);
+    var phys_dev : ptr = deref(devices + cast(sel, i32));
+
+    var name_buf : ptr = malloc(VK_PHYSICAL_DEVICE_PROPERTIES_SIZE);
+    memset(name_buf, 0, VK_PHYSICAL_DEVICE_PROPERTIES_SIZE);
+    vkGetPhysicalDeviceProperties(phys_dev, name_buf);
+    var sel_name : str = vk_read_str(name_buf, VK_PROPS_OFFSET_DEVICE_NAME);
+    println("── Selected device [" + to_str(sel) + "]: " + sel_name);
+    free(name_buf);
+    println("");
+
+    /* ── 5. Find graphics queue family ── */
+    var gfx_family : u32 = find_gfx_family(phys_dev);
+    if (gfx_family == 4294967295) {
+        println("[FAIL] No graphics queue family on selected device.");
+        free(cast(devices, ptr));
+        vkDestroyInstance(instance, null);
+        return 1;
+    }
+    println("Graphics queue family index: " + to_str(gfx_family));
+    println("");
+
+    /* ── 6. Create logical device ── */
+    println("── Creating logical device ───────────────────────────────");
+    var device : ptr = create_logical_device(phys_dev, gfx_family);
+    if (device == null) {
+        free(cast(devices, ptr));
+        vkDestroyInstance(instance, null);
+        return 1;
+    }
+
+    /* ── 7. Retrieve the graphics queue handle ── */
+    var queue : ptr = null;
+    vkGetDeviceQueue(device, gfx_family, 0, addr(queue));
+    if (queue != null) {
+        println("[OK] VkQueue (graphics) handle retrieved.");
+    } else {
+        println("[NOTE] VkQueue handle appears null — may be opaque on MoltenVK (non-fatal).");
+    }
+    println("");
+
+    /* ── 8. Capabilities summary ── */
+    println("── Final capabilities summary ────────────────────────────");
+    var sum_buf : ptr = malloc(VK_PHYSICAL_DEVICE_PROPERTIES_SIZE);
+    memset(sum_buf, 0, VK_PHYSICAL_DEVICE_PROPERTIES_SIZE);
+    vkGetPhysicalDeviceProperties(phys_dev, sum_buf);
+
+    var api_v : u32 = vk_read_u32(sum_buf, VK_PROPS_OFFSET_API_VERSION);
+    var dev_n : str = vk_read_str(sum_buf, VK_PROPS_OFFSET_DEVICE_NAME);
+    var dev_t : u32 = vk_read_u32(sum_buf, VK_PROPS_OFFSET_DEVICE_TYPE);
+
+    println("Device          : " + dev_n);
+    println("Type            : " + vk_device_type_str(dev_t));
+    println("Vulkan API      : " +
+            to_str(vk_api_major(api_v)) + "." +
+            to_str(vk_api_minor(api_v)) + "." +
+            to_str(vk_api_patch(api_v)));
+    println("Graphics family : " + to_str(gfx_family));
+    println("Queue priority  : 1.0 (max)");
+
+    free(sum_buf);
+    println("");
+
+    /* ── 9. Cleanup (LIFO) ── */
+    println("── Cleanup ───────────────────────────────────────────────");
+    vkDestroyDevice(device, null);
+    println("[OK] VkDevice destroyed.");
+
+    free(cast(devices, ptr));
+
+    vkDestroyInstance(instance, null);
+    println("[OK] VkInstance destroyed.");
+
+    println("");
+    println("Done.");
+    return 0;
+}
